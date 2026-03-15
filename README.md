@@ -82,8 +82,16 @@ sudo systemctl enable --now bluetooth
 
 ## Installation
 
+**One-liner (recommended):**
+
 ```bash
-git clone https://github.com/yourusername/bitaud.git
+sudo curl -L https://github.com/BITtech05/bitaud/releases/latest/download/bitaud -o /usr/local/bin/bitaud && sudo chmod +x /usr/local/bin/bitaud
+```
+
+**Or clone the repo:**
+
+```bash
+git clone https://github.com/BITtech05/bitaud.git
 cd bitaud
 sudo cp bitaud /usr/local/bin/bitaud
 sudo chmod +x /usr/local/bin/bitaud
