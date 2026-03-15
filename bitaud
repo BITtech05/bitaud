@@ -1,0 +1,1097 @@
+#!/usr/bin/env bash
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║   bitaud  —  dual audio output router  v2.0                        ║
+# ║   Arch Linux + Hyprland  ·  PipeWire-native                       ║
+# ║                                                                    ║
+# ║   Modes:                                                           ║
+# ║     NORMAL  — AUX+AUX / AUX+BT / USB+anything                    ║
+# ║               null-sink hub + two loopbacks (PipeWire-native)     ║
+# ║                                                                    ║
+# ║     BT+BT   — Two Bluetooth headphones on one adapter             ║
+# ║               BlueZ MultiProfile + PipeWire quality tuning        ║
+# ║               + automatic A2DP codec negotiation                  ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# ── terminal colours ────────────────────────────────────────────────────
+RST=$'\e[0m'; BOLD=$'\e[1m'; DIM=$'\e[2m'; UL=$'\e[4m'
+CY=$'\e[38;5;87m'    # cyan
+PK=$'\e[38;5;213m'   # pink
+GR=$'\e[38;5;120m'   # green
+YL=$'\e[38;5;228m'   # yellow
+RD=$'\e[38;5;203m'   # red
+BL=$'\e[38;5;111m'   # blue
+GY=$'\e[38;5;245m'   # gray
+WH=$'\e[38;5;255m'   # white
+
+# ── global state ────────────────────────────────────────────────────────
+PREV_SINK=""
+PREV_SOURCE=""
+HUB_SINK="bitaud_hub"
+HUB_MOD=""
+LB1_MOD=""
+LB2_MOD=""
+BT_MULTIPROFILE_ENABLED=0   # did WE enable it (so we can revert)
+BT_EXPERIMENTAL_ENABLED=0   # did WE enable it
+CLEANUP_DONE=0
+MODE=""                      # "normal" or "btbt"
+SINK1_KEEPALIVE=""           # real sink name kept awake by watcher
+SINK2_KEEPALIVE=""           # real sink name kept awake by watcher
+
+# ────────────────────────────────────────────────────────────────────────
+#  UI HELPERS
+# ────────────────────────────────────────────────────────────────────────
+
+banner() {
+  clear
+  echo
+  echo -e "  ${CY}${BOLD}██████╗ ██╗████████╗ █████╗ ██╗   ██╗██████╗ ${RST}"
+  echo -e "  ${CY}${BOLD}██╔══██╗██║╚══██╔══╝██╔══██╗██║   ██║██╔══██╗${RST}"
+  echo -e "  ${PK}${BOLD}██████╔╝██║   ██║   ███████║██║   ██║██║  ██║${RST}"
+  echo -e "  ${PK}${BOLD}██╔══██╗██║   ██║   ██╔══██║██║   ██║██║  ██║${RST}"
+  echo -e "  ${CY}${BOLD}██████╔╝██║   ██║   ██║  ██║╚██████╔╝██████╔╝${RST}"
+  echo -e "  ${CY}${BOLD}╚═════╝ ╚═╝   ╚═╝   ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ${RST}"
+  echo
+  echo -e "  ${GY}dual audio output  ·  Arch + Hyprland  ·  PipeWire-native  v2.0${RST}"
+  echo -e "  ${DIM}────────────────────────────────────────────────────────────────${RST}"
+  echo
+}
+
+ok()    { echo -e "  ${GR}✔${RST}  $*"; }
+info()  { echo -e "  ${CY}»${RST}  $*"; }
+warn()  { echo -e "  ${YL}⚠${RST}   $*"; }
+err()   { echo -e "  ${RD}✖${RST}  $*" >&2; }
+note()  { echo -e "  ${GY}  $*${RST}"; }
+
+sep() {
+  echo
+  echo -e "  ${BOLD}${BL}$*${RST}"
+  echo -e "  ${DIM}$(printf '─%.0s' {1..54})${RST}"
+}
+
+spin() {
+  local pid=$1 lbl="${2:-Working…}"
+  local fr=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
+  local i=0
+  while kill -0 "$pid" 2>/dev/null; do
+    printf "\r  ${CY}%s${RST}  %s   " "${fr[$((i%10))]}" "$lbl"
+    i=$((i+1)); sleep 0.08
+  done
+  printf "\r%-68s\r" " "
+}
+
+ask_yn() {
+  # ask_yn "prompt" → returns 0=yes 1=no
+  local prompt="$1"
+  echo -ne "  ${YL}?${RST}  ${BOLD}${prompt}${RST} ${DIM}[y/N]${RST}: "
+  local ans; read -r ans </dev/tty
+  [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]
+}
+
+# ────────────────────────────────────────────────────────────────────────
+#  DEPENDENCY CHECK
+# ────────────────────────────────────────────────────────────────────────
+
+check_deps() {
+  sep "Checking dependencies"
+  local miss=()
+
+  for c in pactl pw-cli bluetoothctl; do
+    if command -v "$c" &>/dev/null; then
+      ok "${c}"
+    else
+      err "${c}  ${DIM}not found${RST}"
+      miss+=("$c")
+    fi
+  done
+
+  # optional but helpful
+  for c in pw-link wpctl; do
+    if command -v "$c" &>/dev/null; then
+      ok "${c}  ${GY}(optional)${RST}"
+    else
+      note "${c}  ${GY}optional — not found${RST}"
+    fi
+  done
+
+  if [[ ${#miss[@]} -gt 0 ]]; then
+    echo
+    err "Missing required tools: ${miss[*]}"
+    echo -e "\n  Install:  ${YL}sudo pacman -S pipewire pipewire-pulse wireplumber bluez bluez-utils${RST}\n"
+    exit 1
+  fi
+
+  if ! pactl info &>/dev/null 2>&1; then
+    err "PipeWire/PulseAudio interface is not running."
+    echo -e "  Fix:  ${YL}systemctl --user start pipewire pipewire-pulse wireplumber${RST}"
+    exit 1
+  fi
+  ok "PipeWire is running"
+}
+
+# ────────────────────────────────────────────────────────────────────────
+#  SINK / DEVICE HELPERS
+# ────────────────────────────────────────────────────────────────────────
+
+# Output: NAME\tDESCRIPTION  per line (no virtual/monitor sinks)
+get_real_sinks() {
+  pactl list sinks 2>/dev/null | awk '
+    /^Sink #/         { name=""; desc="" }
+    /^\tName:/        { name=$2 }
+    /^\tDescription:/ { $1=""; sub(/^ /,""); desc=$0 }
+    desc!="" && name!="" {
+      if (name !~ /bitaud_hub/ && name !~ /\.monitor/) {
+        print name "\t" desc
+      }
+      name=""; desc=""
+    }
+  ' || true
+}
+
+count_real_sinks() {
+  local n; n=$(get_real_sinks | grep -c "." 2>/dev/null) || n=0
+  echo "$n"
+}
+
+# classify <sink_name> <sink_desc> → bluetooth | hdmi | usb | analog
+classify() {
+  local n="${1,,}" d="${2,,}"
+  [[ "$n" == *bluez* || "$n" == *bluetooth* || "$d" == *bluetooth* ]] && { echo "bluetooth"; return; }
+  [[ "$n" == *hdmi*  || "$d" == *hdmi*  ]]                            && { echo "hdmi";      return; }
+  [[ "$n" == *usb*   || "$d" == *usb*   ]]                            && { echo "usb";       return; }
+  echo "analog"
+}
+
+type_icon() {
+  case "$1" in
+    bluetooth) echo "󰂯" ;; hdmi) echo "󰍹" ;; usb) echo "󰚥" ;; *) echo "󰓃" ;;
+  esac
+}
+
+type_label() {
+  case "$1" in
+    bluetooth) echo "Bluetooth A2DP" ;; hdmi) echo "HDMI" ;;
+    usb)       echo "USB Audio"      ;; *)    echo "AUX / Analog" ;;
+  esac
+}
+
+# ────────────────────────────────────────────────────────────────────────
+#  WAIT + SCAN
+# ────────────────────────────────────────────────────────────────────────
+
+wait_for_devices() {
+  local need=2 found interval=2 max_wait=90 elapsed=0
+  found=$(count_real_sinks)
+  [[ "$found" -ge "$need" ]] && return 0
+
+  sep "Scanning for audio devices"
+  echo
+  warn "Only ${found} audio device(s) detected — need at least ${need}."
+  echo
+  info "Connect your second device now (headphones, Bluetooth, AUX)..."
+  info "bitaud will detect it automatically."
+  echo
+  echo -e "  ${DIM}Press Ctrl-C to abort.${RST}"
+  echo
+
+  local dots=0
+  while [[ $elapsed -lt $max_wait ]]; do
+    found=$(count_real_sinks)
+    if [[ "$found" -ge "$need" ]]; then
+      printf "\r%-68s\r" " "
+      ok "Found ${found} device(s) — continuing!"
+      sleep 0.3; return 0
+    fi
+    printf "\r  ${CY}⠿${RST}  Scanning${GY}%s${RST}  ${DIM}[${found}/${need} devices visible]${RST}   " \
+      "$(printf '.%.0s' $(seq 1 $((dots%4+1))))"
+    dots=$((dots+1)); elapsed=$((elapsed+interval)); sleep "$interval"
+  done
+
+  printf "\r%-68s\r" " "
+  echo
+  err "Timed out (${max_wait}s). Only ${found} device(s) found."
+  err "Power on your second device and try again."
+  exit 1
+}
+
+# ────────────────────────────────────────────────────────────────────────
+#  DEVICE PICKER
+# ────────────────────────────────────────────────────────────────────────
+
+PICK_NAME="" PICK_DESC="" PICK_TYPE=""
+
+# pick_sink <prompt> [exclude_name] [filter_type]
+# filter_type: "bluetooth" → only show BT sinks; "nonbt" → hide BT sinks; "" → show all
+pick_sink() {
+  local prompt="$1"
+  local excl="${2:-__none__}"
+  local filter="${3:-}"
+
+  local -a names=() descs=() types=()
+  while IFS=$'\t' read -r name desc; do
+    [[ -z "$name" ]] && continue
+    [[ "$name" == "$excl" ]] && continue
+    local t; t=$(classify "$name" "$desc")
+    # apply filter
+    if [[ "$filter" == "bluetooth" && "$t" != "bluetooth" ]]; then continue; fi
+    if [[ "$filter" == "nonbt"     && "$t" == "bluetooth" ]]; then continue; fi
+    names+=("$name"); descs+=("$desc"); types+=("$t")
+  done < <(get_real_sinks)
+
+  if [[ ${#names[@]} -eq 0 ]]; then
+    err "No matching devices found for selection."
+    exit 1
+  fi
+
+  echo
+  for i in "${!names[@]}"; do
+    local icon lbl
+    icon=$(type_icon "${types[$i]}"); lbl=$(type_label "${types[$i]}")
+    echo -e "  ${CY}${BOLD}[$((i+1))]${RST}  ${icon}  ${BOLD}${descs[$i]}${RST}"
+    echo -e "       ${GY}${lbl}  ·  ${DIM}${names[$i]}${RST}"
+    echo
+  done
+
+  while true; do
+    echo -ne "  ${YL}?${RST}  ${BOLD}${prompt}${RST} ${DIM}(1–${#names[@]})${RST}: "
+    local ch; read -r ch </dev/tty
+    if [[ "$ch" =~ ^[0-9]+$ ]] && (( ch >= 1 && ch <= ${#names[@]} )); then
+      PICK_NAME="${names[$((ch-1))]}"; PICK_DESC="${descs[$((ch-1))]}"; PICK_TYPE="${types[$((ch-1))]}"; return 0
+    fi
+    warn "Enter a number between 1 and ${#names[@]}."
+  done
+}
+
+# ────────────────────────────────────────────────────────────────────────
+#  COMBO DETECTION  — figure out what pair the user has chosen
+# ────────────────────────────────────────────────────────────────────────
+
+# Returns: "btbt" | "normal"
+detect_combo() {
+  local t1="$1" t2="$2"
+  if [[ "$t1" == "bluetooth" && "$t2" == "bluetooth" ]]; then
+    echo "btbt"
+  else
+    echo "normal"
+  fi
+}
+
+# ────────────────────────────────────────────────────────────────────────
+#  BLUETOOTH  — count BT sinks currently visible
+# ────────────────────────────────────────────────────────────────────────
+
+count_bt_sinks() {
+  local n=0
+  while IFS=$'\t' read -r name desc; do
+    [[ -z "$name" ]] && continue
+    local t; t=$(classify "$name" "$desc")
+    [[ "$t" == "bluetooth" ]] && n=$((n+1))
+  done < <(get_real_sinks)
+  echo "$n"
+}
+
+# ────────────────────────────────────────────────────────────────────────
+#  BT+BT MODE  — BlueZ MultiProfile + PipeWire quality tuning
+# ────────────────────────────────────────────────────────────────────────
+
+BT_CONF="/etc/bluetooth/main.conf"
+BLUEZ_RESTART_NEEDED=0
+
+bt_check_multiprofile() {
+  # Returns: "enabled" | "disabled" | "no_conf"
+  [[ ! -f "$BT_CONF" ]] && { echo "no_conf"; return; }
+  if grep -qE '^\s*MultiProfile\s*=\s*multiple' "$BT_CONF" 2>/dev/null; then
+    echo "enabled"
+  else
+    echo "disabled"
+  fi
+}
+
+bt_check_experimental() {
+  [[ ! -f "$BT_CONF" ]] && { echo "no_conf"; return; }
+  if grep -qE '^\s*Experimental\s*=\s*true' "$BT_CONF" 2>/dev/null; then
+    echo "enabled"
+  else
+    echo "disabled"
+  fi
+}
+
+bt_enable_multiprofile() {
+  # Idempotent — only writes if not already set
+  local mp; mp=$(bt_check_multiprofile)
+  local ex; ex=$(bt_check_experimental)
+
+  if [[ "$mp" == "enabled" && "$ex" == "enabled" ]]; then
+    info "BlueZ MultiProfile already enabled."
+    return 0
+  fi
+
+  info "Enabling BlueZ MultiProfile + Experimental mode..."
+  info "  ${DIM}(requires sudo — this is safe and fully reversible)${RST}"
+  echo
+
+  # Backup
+  if [[ -f "$BT_CONF" ]]; then
+    sudo cp "$BT_CONF" "${BT_CONF}.bitaud_backup" 2>/dev/null \
+      && ok "Backed up ${BT_CONF} → ${BT_CONF}.bitaud_backup"
+  fi
+
+  # Apply changes
+  # Strategy: use awk to patch existing keys, or append [Policy] section
+  local tmp; tmp=$(mktemp)
+
+  if [[ ! -f "$BT_CONF" ]]; then
+    # Create minimal config
+    sudo tee "$BT_CONF" >/dev/null <<'EOF'
+[General]
+Experimental = true
+
+[Policy]
+MultiProfile = multiple
+EOF
+  else
+    # Patch in-place using awk
+    awk '
+      /^\[General\]/ { in_general=1 }
+      /^\[/ && !/^\[General\]/ { in_general=0 }
+      in_general && /^\s*#?\s*Experimental\s*=/ {
+        print "Experimental = true"; next
+      }
+      /^\[Policy\]/ { in_policy=1 }
+      /^\[/ && !/^\[Policy\]/ { in_policy=0 }
+      in_policy && /^\s*#?\s*MultiProfile\s*=/ {
+        print "MultiProfile = multiple"; next
+      }
+      { print }
+    ' "$BT_CONF" > "$tmp"
+
+    # Check if keys were added; if not, append sections
+    if ! grep -qE '^\s*Experimental\s*=\s*true' "$tmp"; then
+      # Add under [General] or append section
+      if grep -q '^\[General\]' "$tmp"; then
+        sed -i '/^\[General\]/a Experimental = true' "$tmp"
+      else
+        echo -e "\n[General]\nExperimental = true" >> "$tmp"
+      fi
+    fi
+    if ! grep -qE '^\s*MultiProfile\s*=\s*multiple' "$tmp"; then
+      if grep -q '^\[Policy\]' "$tmp"; then
+        sed -i '/^\[Policy\]/a MultiProfile = multiple' "$tmp"
+      else
+        echo -e "\n[Policy]\nMultiProfile = multiple" >> "$tmp"
+      fi
+    fi
+
+    sudo cp "$tmp" "$BT_CONF"
+    rm -f "$tmp"
+  fi
+
+  BT_MULTIPROFILE_ENABLED=1
+  BT_EXPERIMENTAL_ENABLED=1
+  BLUEZ_RESTART_NEEDED=1
+  ok "BlueZ config updated."
+}
+
+bt_restart_service() {
+  info "Restarting bluetooth service..."
+  if sudo systemctl restart bluetooth 2>/dev/null; then
+    ok "Bluetooth service restarted."
+    sleep 1.5   # give BlueZ time to come up
+  else
+    warn "Could not restart bluetooth — you may need to do it manually."
+    warn "  sudo systemctl restart bluetooth"
+  fi
+}
+
+bt_restore_conf() {
+  if [[ $BT_MULTIPROFILE_ENABLED -eq 0 && $BT_EXPERIMENTAL_ENABLED -eq 0 ]]; then
+    return 0
+  fi
+  local bak="${BT_CONF}.bitaud_backup"
+  if [[ -f "$bak" ]]; then
+    if sudo cp "$bak" "$BT_CONF" 2>/dev/null; then
+      ok "BlueZ config restored from backup."
+      sudo rm -f "$bak" 2>/dev/null || true
+    else
+      warn "Could not restore BlueZ config. Manual restore:"
+      warn "  sudo cp ${bak} ${BT_CONF}"
+    fi
+    # Restart so the restored config takes effect
+    sudo systemctl restart bluetooth 2>/dev/null || true
+    sleep 0.5
+  fi
+}
+
+# After enabling MultiProfile + restarting BlueZ, the BT devices may have
+# disconnected. Reconnect them via bluetoothctl.
+bt_reconnect_device() {
+  local mac="$1" desc="$2"
+  info "Reconnecting ${desc}..."
+  # bluetoothctl connect is synchronous-ish; give it a few tries
+  local tries=3 i=0
+  while [[ $i -lt $tries ]]; do
+    if bluetoothctl connect "$mac" 2>/dev/null | grep -q "Connection successful"; then
+      ok "Reconnected: ${desc}"
+      return 0
+    fi
+    i=$((i+1)); sleep 1
+  done
+  warn "Could not auto-reconnect ${desc}. Reconnect manually in your BT settings."
+  return 1
+}
+
+# Extract MAC address from a bluez sink name like
+#   bluez_output.AA_BB_CC_DD_EE_FF.a2dp_sink
+bt_mac_from_sink() {
+  local name="$1"
+  # Match hex pairs separated by underscores
+  echo "$name" | grep -oP '([0-9A-Fa-f]{2}_){5}[0-9A-Fa-f]{2}' \
+    | tr '_' ':' | head -1 || echo ""
+}
+
+# Check if adapter hardware actually supports simultaneous A2DP connections
+# by looking at hciconfig / btmon capabilities (best-effort heuristic)
+bt_adapter_info() {
+  local hci
+  hci=$(hciconfig 2>/dev/null | head -1 | awk '{print $1}' | tr -d ':') || hci="hci0"
+  echo "$hci"
+}
+
+# Tune PipeWire/WirePlumber A2DP quality for a BT sink
+# Sets highest available codec preference and buffer tuning via pw-cli
+bt_tune_sink() {
+  local sink_name="$1"
+  # Try to set sample rate to 48000 (AAC/LDAC sweet spot) if supported
+  pactl set-sink-volume "$sink_name" 100% 2>/dev/null || true
+  # Attempt to raise quantum/latency for BT stability via pw-cli
+  # This avoids underruns on back-to-back BT streams
+  pw-cli set-param "$sink_name" Props \
+    '{ "audio.rate": 48000, "audio.format": "S16LE" }' 2>/dev/null || true
+}
+
+# ────────────────────────────────────────────────────────────────────────
+#  NORMAL MODE  — null-sink hub + loopbacks
+# ────────────────────────────────────────────────────────────────────────
+
+save_state() {
+  PREV_SINK=$(pactl get-default-sink 2>/dev/null || echo "")
+  # Don't save hub as previous sink — means a prior run didn't clean up
+  if [[ "$PREV_SINK" == *"bitaud"* ]]; then
+    warn "Detected leftover bitaud hub as default sink — purging first..."
+    purge_leftover_modules
+    PREV_SINK=$(pactl list short sinks 2>/dev/null \
+      | grep -v "bitaud" | head -1 | awk '{print $2}' || echo "")
+  fi
+  PREV_SOURCE=$(pactl get-default-source 2>/dev/null || echo "")
+}
+
+# Purge any leftover bitaud modules from a previous crashed/unclean run
+purge_leftover_modules() {
+  local purged=0
+
+  # Unload all loopback modules pointing at bitaud_hub
+  while IFS= read -r line; do
+    local mid; mid=$(echo "$line" | awk '{print $1}')
+    [[ -z "$mid" ]] && continue
+    pactl unload-module "$mid" 2>/dev/null && purged=$((purged+1)) || true
+  done < <(pactl list short modules 2>/dev/null \
+    | grep -E "loopback.*bitaud|null-sink.*bitaud" || true)
+
+  # Also unload by searching module args for bitaud_hub
+  while IFS= read -r line; do
+    local mid; mid=$(echo "$line" | awk '{print $1}')
+    [[ -z "$mid" ]] && continue
+    pactl unload-module "$mid" 2>/dev/null || true
+  done < <(pactl list modules 2>/dev/null | awk '
+    /^Module #/ { mid=substr($2,2) }
+    /bitaud_hub/ { print mid }
+  ' | sort -u || true)
+
+  [[ $purged -gt 0 ]] && ok "Purged ${purged} leftover module(s) from previous run."
+  sleep 0.3
+}
+
+create_hub() {
+  local mid
+  mid=$(pactl load-module module-null-sink \
+    sink_name="${HUB_SINK}" \
+    sink_properties="device.description='bitaud\ Hub'" \
+    rate=48000 \
+    2>/dev/null) || {
+      err "Could not create virtual hub sink."
+      echo -e "  Check:  ${YL}systemctl --user status pipewire-pulse${RST}"
+      exit 1
+    }
+  HUB_MOD="$mid"
+}
+
+# ── pw-link based routing ───────────────────────────────────────────────
+# We use pw-link instead of module-loopback because:
+#   - module-loopback under PipeWire's PA compat layer does NOT keep
+#     sinks in RUNNING state — they go SUSPENDED and audio stops
+#   - pw-link creates native PipeWire graph links that keep nodes alive
+#     as long as the link exists — exactly what we need
+#
+# Port naming convention:
+#   hub monitor  : bitaud_hub:monitor_FL / monitor_FR
+#   AUX sink     : alsa_output.*:playback_FL / playback_FR
+#   BT sink      : bluez_output.*:playback_FL / playback_FR
+
+PW_LINK_IDS=()   # store link IDs so we can remove them on exit
+
+# Get playback port names for a sink (returns FL and FR port names)
+get_sink_ports() {
+  local sink_name="$1"
+  pw-link -i 2>/dev/null | grep "^${sink_name}:playback_" || \
+  pw-link -i 2>/dev/null | grep "^${sink_name}:input_"   || true
+}
+
+# Create pw-link from hub monitor → sink playback ports
+# Stores link IDs in PW_LINK_IDS for cleanup
+pwlink_hub_to_sink() {
+  local sink_name="$1"
+  local -a ports=()
+  while IFS= read -r p; do
+    [[ -n "$p" ]] && ports+=("$p")
+  done < <(get_sink_ports "$sink_name")
+
+  if [[ ${#ports[@]} -eq 0 ]]; then
+    warn "No playback ports found for ${sink_name}"
+    return 1
+  fi
+
+  local linked=0
+  for port in "${ports[@]}"; do
+    # Determine channel: FL or FR or MONO
+    local ch=""
+    if [[ "$port" == *_FL || "$port" == *playback_FL ]]; then ch="FL"
+    elif [[ "$port" == *_FR || "$port" == *playback_FR ]]; then ch="FR"
+    elif [[ "$port" == *MONO || "$port" == *input_MONO ]]; then ch="MONO"
+    fi
+
+    local src_port=""
+    case "$ch" in
+      FL)   src_port="${HUB_SINK}:monitor_FL" ;;
+      FR)   src_port="${HUB_SINK}:monitor_FR" ;;
+      MONO) src_port="${HUB_SINK}:monitor_FL" ;;
+      *)    src_port="${HUB_SINK}:monitor_FL" ;;
+    esac
+
+    # pw-link returns the link ID on stdout
+    local lid
+    lid=$(pw-link "$src_port" "$port" 2>/dev/null) || true
+    if [[ -n "$lid" ]]; then
+      PW_LINK_IDS+=("$lid")
+    fi
+    linked=$((linked+1))
+  done
+
+  [[ $linked -gt 0 ]] && return 0 || return 1
+}
+
+# Remove all pw-links we created
+pwlink_remove_all() {
+  for lid in "${PW_LINK_IDS[@]:-}"; do
+    [[ -z "$lid" ]] && continue
+    pw-link -d "$lid" 2>/dev/null || true
+  done
+  PW_LINK_IDS=()
+}
+
+move_to_hub() {
+  local moved=0
+  local hub_node
+  hub_node=$(pactl list short sinks 2>/dev/null \
+    | grep "${HUB_SINK}" | head -1 | awk '{print $1}' || echo "")
+
+  pactl set-default-sink "${HUB_SINK}" 2>/dev/null || true
+  if command -v wpctl &>/dev/null && [[ -n "$hub_node" ]]; then
+    wpctl set-default "$hub_node" 2>/dev/null || true
+  fi
+
+  while IFS= read -r id; do
+    [[ -z "$id" ]] && continue
+    pactl move-sink-input "$id" "${HUB_SINK}" 2>/dev/null && moved=$((moved+1)) || true
+  done < <(pactl list short sink-inputs 2>/dev/null | awk '{print $1}')
+  echo "$moved"
+}
+
+# Background watcher — re-routes escaped streams back to hub every 3s
+WATCHER_PID=""
+
+start_stream_watcher() {
+  local hub="$HUB_SINK"
+  (
+    while true; do
+      while IFS=$'\t' read -r input_id sink_id; do
+        [[ -z "$input_id" ]] && continue
+        local sname
+        sname=$(pactl list short sinks 2>/dev/null \
+          | awk -v id="$sink_id" '$1==id {print $2}' | head -1 || echo "")
+        if [[ -n "$sname" && "$sname" != "$hub" ]]; then
+          pactl move-sink-input "$input_id" "$hub" 2>/dev/null || true
+        fi
+      done < <(pactl list short sink-inputs 2>/dev/null | awk '{print $1 "\t" $2}')
+      sleep 3
+    done
+  ) &
+  WATCHER_PID=$!
+}
+
+# ────────────────────────────────────────────────────────────────────────
+#  CLEANUP / RESTORE
+# ────────────────────────────────────────────────────────────────────────
+
+restore() {
+  [[ $CLEANUP_DONE -eq 1 ]] && return
+  CLEANUP_DONE=1
+  stty sane 2>/dev/null || true
+
+  # Kill stream watcher
+  if [[ -n "${WATCHER_PID:-}" ]]; then
+    kill "$WATCHER_PID" 2>/dev/null || true
+  fi
+
+  echo
+  sep "Restoring your audio"
+
+  # Move streams back to previous sink before destroying hub
+  if [[ -n "$PREV_SINK" ]]; then
+    while IFS= read -r id; do
+      [[ -z "$id" ]] && continue
+      pactl move-sink-input "$id" "$PREV_SINK" 2>/dev/null || true
+    done < <(pactl list short sink-inputs 2>/dev/null | awk '{print $1}')
+  fi
+
+  # Remove pw-links first
+  pwlink_remove_all
+  ok "pw-link routes removed."
+
+  # Unload any leftover loopback modules (btbt mode still uses them)
+  for mid in "${LB1_MOD:-}" "${LB2_MOD:-}"; do
+    [[ -z "$mid" ]] && continue
+    pactl unload-module "$mid" 2>/dev/null && ok "Loopback ${mid} removed." || true
+  done
+
+  sleep 0.35
+
+  # Unload hub
+  if [[ -n "$HUB_MOD" ]]; then
+    pactl unload-module "$HUB_MOD" 2>/dev/null && ok "Hub sink removed." || true
+  fi
+
+  # Restore default sink
+  if [[ -n "$PREV_SINK" ]]; then
+    if pactl set-default-sink "$PREV_SINK" 2>/dev/null; then
+      ok "Default sink restored → ${BOLD}${PREV_SINK}${RST}"
+    else
+      warn "Previous sink unavailable — falling back to first available."
+      local fb
+      fb=$(pactl list short sinks 2>/dev/null \
+           | grep -v "bitaud" | head -1 | awk '{print $2}' || true)
+      [[ -n "$fb" ]] && pactl set-default-sink "$fb" 2>/dev/null || true
+    fi
+  fi
+
+  # Restore default source
+  if [[ -n "$PREV_SOURCE" ]]; then
+    pactl set-default-source "$PREV_SOURCE" 2>/dev/null || true
+    ok "Default source restored."
+  fi
+
+  # Restore BlueZ config if we touched it
+  bt_restore_conf
+
+  echo
+  echo -e "  ${GR}${BOLD}✔  All clean.${RST}  ${GY}Your audio is back to normal.${RST}"
+  echo
+}
+
+trap 'restore; exit 0' INT TERM EXIT
+
+# ────────────────────────────────────────────────────────────────────────
+#  CONTROL LOOP  (shared by both modes)
+# ────────────────────────────────────────────────────────────────────────
+
+control_loop() {
+  local d1="$1" t1="$2" d2="$3" t2="$4"
+  local i1 i2 l1 l2
+  i1=$(type_icon "$t1"); i2=$(type_icon "$t2")
+  l1=$(type_label "$t1"); l2=$(type_label "$t2")
+
+  local mode_tag=""
+  [[ "$MODE" == "btbt" ]] && mode_tag="  ${PK}${DIM}[BT+BT multiprofile]${RST}"
+
+  echo
+  echo -e "  ${GR}${BOLD}▶  bitaud is running — audio mirrored to both devices${RST}${mode_tag}"
+  echo -e "  ${DIM}────────────────────────────────────────────────────────────────${RST}"
+  echo
+  echo -e "  ${CY}Device 1${RST}  ${i1}  ${BOLD}${d1}${RST}  ${GY}(${l1})${RST}"
+  echo -e "  ${PK}Device 2${RST}  ${i2}  ${BOLD}${d2}${RST}  ${GY}(${l2})${RST}"
+  echo
+  echo -e "  ${GY}Controls:  +/=  vol up   -  vol down   m  mute/unmute   q  quit${RST}"
+  echo
+
+  if ! stty raw -echo 2>/dev/null; then
+    echo -e "  ${GY}(Non-interactive shell — press Ctrl-C to quit)${RST}"
+    while true; do sleep 1; done
+    return
+  fi
+
+  local muted=0
+  while true; do
+    local key=""
+    key=$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n') || true
+    stty sane 2>/dev/null || true
+
+    local vol_sink="${HUB_SINK}"
+    # In BT+BT mode the hub may not exist; control S1 directly
+    if [[ "$MODE" == "btbt" ]]; then
+      vol_sink="${S1_NAME_GLOBAL}"
+    fi
+
+    case "$key" in
+      2b|3d)  # + or =
+        pactl set-sink-volume "${HUB_SINK}" +5% 2>/dev/null || \
+          pactl set-sink-volume "$vol_sink" +5% 2>/dev/null || true
+        local v; v=$(pactl get-sink-volume "${HUB_SINK}" 2>/dev/null \
+                     | grep -oP '\d+(?=%)' | head -1 || echo "?")
+        printf "\r  ${GR}🔊  Volume → %3s%%${RST}%30s\n" "$v" " "
+        ;;
+      2d)     # -
+        pactl set-sink-volume "${HUB_SINK}" -5% 2>/dev/null || \
+          pactl set-sink-volume "$vol_sink" -5% 2>/dev/null || true
+        local v; v=$(pactl get-sink-volume "${HUB_SINK}" 2>/dev/null \
+                     | grep -oP '\d+(?=%)' | head -1 || echo "?")
+        printf "\r  ${YL}🔉  Volume → %3s%%${RST}%30s\n" "$v" " "
+        ;;
+      6d)     # m
+        if [[ $muted -eq 0 ]]; then
+          pactl set-sink-mute "${HUB_SINK}" 1 2>/dev/null || true; muted=1
+          printf "\r  ${RD}🔇  Muted${RST}%50s\n" " "
+        else
+          pactl set-sink-mute "${HUB_SINK}" 0 2>/dev/null || true; muted=0
+          printf "\r  ${GR}🔊  Unmuted${RST}%47s\n" " "
+        fi
+        ;;
+      71|03|"")  # q or Ctrl-C
+        stty sane 2>/dev/null || true; echo; break ;;
+    esac
+
+    stty raw -echo 2>/dev/null || true
+  done
+
+  stty sane 2>/dev/null || true
+}
+
+# ────────────────────────────────────────────────────────────────────────
+#  NORMAL MODE SETUP
+# ────────────────────────────────────────────────────────────────────────
+
+run_normal_mode() {
+  local s1n="$1" s1d="$2" s1t="$3"
+  local s2n="$4" s2d="$5" s2t="$6"
+
+  sep "Activating dual output  ${DIM}[normal mode]${RST}"
+
+  # ── Step 1: create hub null-sink ──
+  printf "  ${CY}⠋${RST}  Creating virtual hub…\r"
+  create_hub
+  sleep 0.6
+  printf "%-60s\r" " "
+  if ! pactl list short sinks 2>/dev/null | grep -q "${HUB_SINK}"; then
+    err "Hub sink not found — PipeWire rejected null-sink module."
+    exit 1
+  fi
+  ok "Hub created  ${GY}(module ${HUB_MOD})${RST}"
+
+  # ── Step 2: set hub as default + move streams ──
+  local moved; moved=$(move_to_hub)
+  ok "Hub set as default output."
+  [[ "$moved" -gt 0 ]] && ok "Moved ${moved} active stream(s) to hub."
+
+  # ── Step 3: wire hub monitor → both sinks via pw-link ──
+  # pw-link keeps nodes RUNNING — unlike module-loopback which lets them suspend
+  printf "  ${CY}⠋${RST}  Linking hub → ${s1d}…\r"
+  if pwlink_hub_to_sink "$s1n"; then
+    printf "%-60s\r" " "
+    ok "Linked → ${BOLD}${s1d}${RST}"
+  else
+    printf "%-60s\r" " "
+    err "Could not link to ${s1d} — no playback ports found"
+    exit 1
+  fi
+
+  printf "  ${CY}⠋${RST}  Linking hub → ${s2d}…\r"
+  if pwlink_hub_to_sink "$s2n"; then
+    printf "%-60s\r" " "
+    ok "Linked → ${BOLD}${s2d}${RST}"
+  else
+    printf "%-60s\r" " "
+    err "Could not link to ${s2d} — no playback ports found"
+    exit 1
+  fi
+
+  # ── Step 4: verify both sinks are now RUNNING ──
+  sleep 0.5
+  local s1_state s2_state
+  s1_state=$(pactl list sinks 2>/dev/null | awk -v n="$s1n" '
+    /^\tName:/ && $2==n { found=1 }
+    found && /^\tState:/ { print $2; exit }
+  ')
+  s2_state=$(pactl list sinks 2>/dev/null | awk -v n="$s2n" '
+    /^\tName:/ && $2==n { found=1 }
+    found && /^\tState:/ { print $2; exit }
+  ')
+  ok "Sink 1 state: ${BOLD}${s1_state:-unknown}${RST}"
+  ok "Sink 2 state: ${BOLD}${s2_state:-unknown}${RST}"
+
+  if [[ "$s1_state" == "SUSPENDED" || "$s2_state" == "SUSPENDED" ]]; then
+    warn "A sink is still suspended — forcing wake..."
+    pactl suspend-sink "$s1n" 0 2>/dev/null || true
+    pactl suspend-sink "$s2n" 0 2>/dev/null || true
+    sleep 0.3
+  fi
+
+  # ── Step 5: start stream watcher ──
+  SINK1_KEEPALIVE="$s1n"
+  SINK2_KEEPALIVE="$s2n"
+  start_stream_watcher
+
+  ok "Dual audio is live  ♫"
+}
+
+# ────────────────────────────────────────────────────────────────────────
+#  BT+BT MODE SETUP
+# ────────────────────────────────────────────────────────────────────────
+
+# Global needed for control loop volume fallback
+S1_NAME_GLOBAL=""
+
+run_btbt_mode() {
+  local s1n="$1" s1d="$2"
+  local s2n="$3" s2d="$4"
+  S1_NAME_GLOBAL="$s1n"
+
+  sep "BT+BT Mode  ${DIM}— two Bluetooth headphones${RST}"
+  echo
+
+  # ── Step 1: show what we're about to do ──
+  echo -e "  ${WH}${BOLD}What bitaud will do:${RST}"
+  note "1. Enable BlueZ MultiProfile in ${BT_CONF}"
+  note "2. Enable BlueZ Experimental mode (required for multi-A2DP)"
+  note "3. Restart the bluetooth service"
+  note "4. Reconnect both headphones"
+  note "5. Create a PipeWire hub + loopbacks for perfect sync"
+  note "6. Restore everything when you quit"
+  echo
+  warn "Your headphones will briefly disconnect during bluetooth restart."
+  echo
+  if ! ask_yn "Proceed with BT+BT setup?"; then
+    info "Aborted. No changes made."
+    exit 0
+  fi
+  echo
+
+  # ── Step 2: extract MACs before restart ──
+  local mac1 mac2
+  mac1=$(bt_mac_from_sink "$s1n")
+  mac2=$(bt_mac_from_sink "$s2n")
+
+  if [[ -z "$mac1" || -z "$mac2" ]]; then
+    warn "Could not extract MAC addresses from sink names."
+    warn "You may need to reconnect headphones manually after restart."
+  else
+    ok "MAC 1: ${mac1}  ${GY}(${s1d})${RST}"
+    ok "MAC 2: ${mac2}  ${GY}(${s2d})${RST}"
+  fi
+  echo
+
+  # ── Step 3: enable MultiProfile ──
+  bt_enable_multiprofile
+
+  # ── Step 4: restart BlueZ ──
+  if [[ $BLUEZ_RESTART_NEEDED -eq 1 ]]; then
+    bt_restart_service
+  fi
+
+  # ── Step 5: reconnect headphones ──
+  sep "Reconnecting headphones"
+  echo
+  local reconnect_ok=1
+  if [[ -n "$mac1" ]]; then
+    bt_reconnect_device "$mac1" "$s1d" || reconnect_ok=0
+  fi
+  if [[ -n "$mac2" ]]; then
+    bt_reconnect_device "$mac2" "$s2d" || reconnect_ok=0
+  fi
+
+  if [[ $reconnect_ok -eq 0 ]]; then
+    echo
+    warn "One or both headphones didn't auto-reconnect."
+    warn "Please connect them manually now via your Bluetooth manager."
+    echo
+    info "Waiting 10 seconds for you to reconnect..."
+    sleep 10
+  fi
+
+  # ── Step 6: wait for BT sinks to reappear in PipeWire ──
+  sep "Waiting for BT sinks in PipeWire"
+  echo
+  local waited=0 max_bt_wait=30
+  while [[ $waited -lt $max_bt_wait ]]; do
+    local found_bt; found_bt=$(count_bt_sinks)
+    if [[ "$found_bt" -ge 2 ]]; then
+      printf "\r%-68s\r" " "
+      ok "Both Bluetooth sinks are visible in PipeWire!"
+      break
+    fi
+    printf "\r  ${CY}⠿${RST}  Waiting for BT sinks${GY}...${RST}  ${DIM}[${found_bt}/2 ready]${RST}   "
+    sleep 1; waited=$((waited+1))
+  done
+  printf "\r%-68s\r" " "
+
+  local final_bt; final_bt=$(count_bt_sinks)
+  if [[ "$final_bt" -lt 2 ]]; then
+    echo
+    warn "Only ${final_bt} BT sink(s) appeared. Your adapter may not support"
+    warn "simultaneous A2DP connections at the hardware level."
+    echo
+    warn "Falling back to NORMAL mode (hub + loopbacks with whatever is available)."
+    echo
+    MODE="normal"
+    # Refresh sink lists
+    wait_for_devices
+    # Re-pick with whatever is available — just use what we have
+    run_normal_mode "$s1n" "$s1d" "bluetooth" "$s2n" "$s2d" "bluetooth"
+    return
+  fi
+
+  # ── Step 7: tune both BT sinks ──
+  sep "Tuning Bluetooth quality"
+  echo
+  # Refresh sink names (they may have changed after reconnect)
+  # Try to remap by MAC
+  local new_s1n="$s1n" new_s2n="$s2n"
+  if [[ -n "$mac1" ]]; then
+    local m1_fmt; m1_fmt=$(echo "$mac1" | tr ':' '_')
+    local found_s1
+    found_s1=$(pactl list short sinks 2>/dev/null | awk '{print $2}' \
+               | grep -i "$m1_fmt" | head -1 || true)
+    [[ -n "$found_s1" ]] && new_s1n="$found_s1"
+  fi
+  if [[ -n "$mac2" ]]; then
+    local m2_fmt; m2_fmt=$(echo "$mac2" | tr ':' '_')
+    local found_s2
+    found_s2=$(pactl list short sinks 2>/dev/null | awk '{print $2}' \
+               | grep -i "$m2_fmt" | head -1 || true)
+    [[ -n "$found_s2" ]] && new_s2n="$found_s2"
+  fi
+
+  bt_tune_sink "$new_s1n" && ok "Tuned: ${s1d}"
+  bt_tune_sink "$new_s2n" && ok "Tuned: ${s2d}"
+
+  # ── Step 8: create hub + loopbacks ──
+  sep "Wiring PipeWire routes"
+  echo
+
+  # Create hub in main shell
+  printf "  ${CY}⠋${RST}  Creating virtual hub…\r"
+  create_hub
+  sleep 0.6
+  printf "%-60s\r" " "
+  ok "Hub sink created  ${GY}(module ${HUB_MOD})${RST}"
+
+  # Set as default
+  local moved; moved=$(move_to_hub)
+  ok "Hub set as default output."
+  [[ "$moved" -gt 0 ]] && ok "Moved ${moved} stream(s) to hub."
+
+  # Wake both BT sinks before linking
+  pactl suspend-sink "$new_s1n" 0 2>/dev/null || true
+  pactl suspend-sink "$new_s2n" 0 2>/dev/null || true
+  SINK1_KEEPALIVE="$new_s1n"
+  SINK2_KEEPALIVE="$new_s2n"
+  sleep 0.4
+
+  # pw-link hub monitor → both BT sinks
+  printf "  ${CY}⠋${RST}  Linking hub → ${s1d}…\r"
+  pwlink_hub_to_sink "$new_s1n"
+  printf "%-60s\r" " "
+  ok "Linked → ${BOLD}${s1d}${RST}"
+
+  printf "  ${CY}⠋${RST}  Linking hub → ${s2d}…\r"
+  pwlink_hub_to_sink "$new_s2n"
+  printf "%-60s\r" " "
+  ok "Linked → ${BOLD}${s2d}${RST}"
+
+  start_stream_watcher
+
+  ok "BT+BT dual audio is live  ♫"
+  echo
+  note "Tip: If one headphone sounds out-of-sync, it will self-correct"
+  note "     within ~5 seconds as the loopback adjust_time kicks in."
+  echo
+}
+
+# ────────────────────────────────────────────────────────────────────────
+#  MAIN
+# ────────────────────────────────────────────────────────────────────────
+
+main() {
+  banner
+  check_deps
+
+  # ── Purge any leftover bitaud modules from a previous crashed run ──
+  purge_leftover_modules
+
+  # Wait until ≥2 real audio sinks are available
+  wait_for_devices
+
+  save_state
+
+  # ── Count Bluetooth sinks to decide what options to offer ──
+  local bt_count; bt_count=$(count_bt_sinks)
+
+  # ── Pick Device 1 ──
+  sep "Select Device 1  ${DIM}(primary output)${RST}"
+  pick_sink "Choose primary device"
+  local S1_N="$PICK_NAME" S1_D="$PICK_DESC" S1_T="$PICK_TYPE"
+  ok "Primary → ${BOLD}${S1_D}${RST}  ${GY}($(type_label "$S1_T"))${RST}"
+
+  # ── Pick Device 2 ──
+  # If device 1 is BT and there are ≥2 BT devices, offer BT-only picker
+  # If device 1 is not BT, only show non-BT alternatives (no BT+BT path)
+  sep "Select Device 2  ${DIM}(secondary output)${RST}"
+
+  local filter2=""
+  if [[ "$S1_T" != "bluetooth" ]]; then
+    # Device 1 is AUX/USB/HDMI — any device is fine for device 2
+    filter2=""
+  fi
+  # If device 1 IS bluetooth: show all remaining (including other BT)
+
+  pick_sink "Choose secondary device" "$S1_N" "$filter2"
+  local S2_N="$PICK_NAME" S2_D="$PICK_DESC" S2_T="$PICK_TYPE"
+  ok "Secondary → ${BOLD}${S2_D}${RST}  ${GY}($(type_label "$S2_T"))${RST}"
+
+  # ── Detect combo & decide mode ──
+  MODE=$(detect_combo "$S1_T" "$S2_T")
+
+  # ── Route based on mode ──
+  if [[ "$MODE" == "btbt" ]]; then
+    echo
+    echo -e "  ${PK}${BOLD}⚡ Detected: Two Bluetooth devices${RST}"
+    echo -e "  ${GY}  bitaud will use BlueZ MultiProfile mode for simultaneous A2DP.${RST}"
+    run_btbt_mode "$S1_N" "$S1_D" "$S2_N" "$S2_D"
+  else
+    run_normal_mode "$S1_N" "$S1_D" "$S1_T" "$S2_N" "$S2_D" "$S2_T"
+  fi
+
+  # ── Live session ──
+  control_loop "$S1_D" "$S1_T" "$S2_D" "$S2_T"
+}
+
+main "$@"
